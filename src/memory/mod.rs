@@ -126,7 +126,12 @@ fn companion_gate_enabled() -> bool {
 /// bindings) keeps the pipeline every existing measurement was taken on. The
 /// SERVER turns it on: `server::run` sets `SHODH_CE_RERANK=1` unless the
 /// operator already set it, because the paired arms measured +16.5pp p@1 and
-/// +8.7pp recall@10 at n=1531 (#536) for ~190 ms/query at depth 30 on CPU.
+/// +8.7pp recall@10 at n=1531 (#536), for +156 ms p50 / +216 ms p95 per
+/// recall end to end at depth 30 (release build, CPU, the 100-query L1 gate:
+/// 76 -> 232 p50, 79 -> 295 p95). The cross-encoder itself is ~190 ms mean
+/// per query, 83% of query time by the gate's per-stage timing. Runner speed
+/// moved these figures by up to 2.3x across runs of identical code, so they
+/// are the order of magnitude, not a promise.
 pub fn ce_rerank_enabled() -> bool {
     std::env::var("SHODH_CE_RERANK")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -628,7 +633,7 @@ fn tokenize_words(text: &str) -> HashSet<&str> {
 /// `items` must already be sorted, with `tied` reporting whether two elements
 /// compared equal under that sort. Content is fetched ONLY inside runs of two
 /// or more, so a tie-free list costs one linear scan and no lookups.
-fn order_ties_by_content<T>(
+pub(crate) fn order_ties_by_content<T>(
     items: &mut [T],
     tied: impl Fn(&T, &T) -> bool,
     id_of: impl Fn(&T) -> MemoryId,
@@ -2145,6 +2150,46 @@ impl MemorySystem {
             "cross-encoder rerank fired"
         );
         Ok(out.into_iter().take(k).collect())
+    }
+
+    /// The candidate pool the cross-encoder would rescore for `query`: the
+    /// fused ranking fetched at the rerank depth, before any reranking. `None`
+    /// when reranking would not run for this query, so a caller cannot mistake
+    /// the unreranked path for a pool.
+    ///
+    /// Exists for determinism diagnosis. The rerank path fetches the fused
+    /// ranking at depth (30) rather than `k` (10), which also deepens the vector
+    /// candidate pool it is built from, so a repeat can agree on the top 10
+    /// without the reranker and still hand the reranker a different pool.
+    pub fn rerank_input_pool(&self, query: &Query) -> Result<Option<Vec<SharedMemory>>> {
+        if !ce_rerank_enabled() || query.query_text.is_none() || cross_encoder().is_none() {
+            return Ok(None);
+        }
+        let mut deep_query = query.clone();
+        deep_query.max_results = ce_depth().max(query.max_results.max(1));
+        self.recall_fused(&deep_query).map(Some)
+    }
+
+    /// A memory's text from whichever tier holds it, for ordering ties by a
+    /// key the corpus determines. Same lookup order as the recall path's
+    /// `get_content`.
+    fn content_of(&self, id: &MemoryId) -> Option<String> {
+        self.working_memory
+            .read()
+            .get(id)
+            .map(|m| m.experience.content.clone())
+            .or_else(|| {
+                self.session_memory
+                    .read()
+                    .get(id)
+                    .map(|m| m.experience.content.clone())
+            })
+            .or_else(|| {
+                self.long_term_memory
+                    .get(id)
+                    .ok()
+                    .map(|m| m.experience.content.clone())
+            })
     }
 
     fn recall_fused(&self, query: &Query) -> Result<Vec<SharedMemory>> {
@@ -3975,7 +4020,12 @@ impl MemorySystem {
             }
         };
 
-        crate::memory::gold_funnel::record("graph", graph_results.iter().map(|(id, _, _)| id));
+        crate::memory::gold_funnel::record_scored(
+            "graph",
+            graph_results
+                .iter()
+                .map(|(id, activation, _)| (id, *activation)),
+        );
 
         let t_graph = recall_start.elapsed();
         tracing::info!(
@@ -4074,6 +4124,14 @@ impl MemorySystem {
             }
             let mut merged: Vec<(MemoryId, f32)> = best.into_iter().collect();
             merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            // The id is a per-ingest uuid; equal similarities are ordered by
+            // content so two ingests of one corpus agree (see order_ties_by_content).
+            order_ties_by_content(
+                &mut merged,
+                |a, b| a.1.to_bits() == b.1.to_bits(),
+                |x| x.0.clone(),
+                |id| self.content_of(id),
+            );
             merged
         } else {
             vr_pos
@@ -4083,7 +4141,10 @@ impl MemorySystem {
         } else {
             vr
         };
-        crate::memory::gold_funnel::record("vector", vector_results.iter().map(|(id, _)| id));
+        crate::memory::gold_funnel::record_scored(
+            "vector",
+            vector_results.iter().map(|(id, score)| (id, *score)),
+        );
         let t_vector = recall_start.elapsed();
         tracing::info!(
             vector_ms = format!("{:.2}", (t_vector - t_graph).as_secs_f64() * 1000.0),
@@ -4280,7 +4341,10 @@ impl MemorySystem {
                 vector_results
             };
 
-            crate::memory::gold_funnel::record("hybrid", hybrid_ids.iter().map(|(id, _)| id));
+            crate::memory::gold_funnel::record_scored(
+                "hybrid",
+                hybrid_ids.iter().map(|(id, score)| (id, *score)),
+            );
 
             // ===========================================================================
             // LAYER 4: RRF FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
@@ -5443,7 +5507,10 @@ impl MemorySystem {
                 }
             }
 
-            crate::memory::gold_funnel::record("fusion", res.iter().map(|(id, _)| id));
+            crate::memory::gold_funnel::record_scored(
+                "fusion",
+                res.iter().map(|(id, score)| (id, *score)),
+            );
             // GEO INJECTION SURVIVAL (Layer 4.46 companion): `res` is sorted score-
             // descending and geo-injected ids sit at GEO_INJECT_FLOOR, i.e. the very
             // bottom. A plain `truncate(query.max_results)` here runs BEFORE the geo
